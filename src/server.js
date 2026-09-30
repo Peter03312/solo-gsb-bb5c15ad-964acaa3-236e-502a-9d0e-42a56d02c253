@@ -8,7 +8,7 @@ const { seedDemo } = require('./seed');
 const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
 const apiRoutes = require('./routes/api');
-const { InterlockError } = require('./interlocking');
+const { InterlockError, tryFulfillWaiting } = require('./interlocking');
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -17,6 +17,16 @@ const db = getDb();
 if (process.env.SEED_DEMO !== '0') {
   const seeded = seedDemo(db);
   if (seeded) console.log('[startup] 已初始化示例站场（R1/R2/R3）');
+}
+
+// 服务重启后自动尝试兑现历史等待申请（状态全部来自 SQLite，满足条件的立即开放）
+try {
+  const sweep = tryFulfillWaiting();
+  if (sweep.fulfilled.length) {
+    console.log(`[startup] 重启后自动兑现等待申请：#${sweep.fulfilled.join('、#')}`);
+  }
+} catch (e) {
+  console.error('[startup] 等待申请重启兑现失败:', e);
 }
 
 const app = express();

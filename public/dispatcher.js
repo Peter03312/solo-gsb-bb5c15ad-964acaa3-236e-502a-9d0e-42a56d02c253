@@ -188,6 +188,7 @@ function renderSide() {
   }
   side.appendChild(renderSwitchPanel());
   side.appendChild(renderSectionPanel());
+  side.appendChild(renderWaiting());
   side.appendChild(renderInstances());
 }
 
@@ -262,10 +263,13 @@ function renderRouteOps() {
   const btns = html('div', { class: 'row', style: 'margin-top:10px;' });
   const checkBtn = html('button', { class: 'ghost' }, '预检能否开放');
   const openBtn = html('button', { class: 'primary' }, '开放进路（原子锁闭）');
+  const waitBtn = html('button', { class: 'ghost' }, '提交等待申请（不预锁）');
   checkBtn.addEventListener('click', doCheck);
   openBtn.addEventListener('click', doOpen);
+  waitBtn.addEventListener('click', doWait);
   btns.appendChild(checkBtn);
   btns.appendChild(openBtn);
+  btns.appendChild(waitBtn);
   box.appendChild(btns);
 
   // 预检结果区
@@ -318,6 +322,27 @@ function renderRouteOps() {
     } catch (e) {
       toast(e.message, 'err', 6500);
       doCheck(); // 开放失败后刷新预检原因
+    }
+  }
+
+  async function doWait() {
+    try {
+      const data = await api(`/api/routes/${r.id}/wait`, {
+        method: 'POST', body: JSON.stringify({ switchPositions: chosenSwitchPos })
+      });
+      const w = data.request;
+      if (w.status === 'fulfilled') {
+        toast(`等待申请 #${w.id} 已兑现，进路实例 #${w.instanceId} 已开放`, 'ok', 5500);
+      } else {
+        toast(`等待申请 #${w.id} 已提交（顺位 ${w.queuePosition}），资源满足时自动兑现`, 'info', 5500);
+      }
+      await load(true);
+      setTimeout(() => {
+        const node = document.getElementById('wait-' + w.id);
+        if (node) node.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }, 50);
+    } catch (e) {
+      toast(e.message, 'err', 6500);
     }
   }
 
@@ -426,11 +451,104 @@ async function setSec(id, action) {
   } catch (e) { toast(e.message, 'err', 6000); }
 }
 
+/* ------------------------------ 等待申请队列 ------------------------------ */
+
+const WAIT_STATUS = {
+  waiting: ['amber', '等待中'],
+  fulfilled: ['green', '已兑现'],
+  invalidated: ['red', '已失效'],
+  cancelled: ['unknown', '已撤销']
+};
+
+function renderWaiting() {
+  const box = html('div', {});
+  box.appendChild(html('div', { class: 'section-title' }, '④ 等待申请（排队排路，不预锁资源）'));
+  const list = STATE.waitingRequests || [];
+  const active = list.filter((w) => w.status === 'waiting');
+  if (list.length === 0) {
+    box.appendChild(html('div', { class: 'hint' },
+      '暂无等待申请。在上方选择进路与道岔位置后点"提交等待申请"，区段/道岔/进路解除等条件满足时系统会自动兑现。'));
+    return box;
+  }
+
+  if (active.length) {
+    box.appendChild(html('div', { class: 'hint', style: 'margin-bottom:6px;' },
+      `当前 ${active.length} 项等待中：按申请编号排队，争用共享区段/道岔时前项未兑现后项不得越过；资源互不相交者可先兑现。`));
+  }
+
+  // 等待中按顺位（id 升序）在前，其余按时间倒序
+  const ordered = [
+    ...active.slice().sort((a, b) => a.id - b.id),
+    ...list.filter((w) => w.status !== 'waiting')
+  ];
+  ordered.forEach((w) => box.appendChild(renderWaitingCard(w)));
+  return box;
+}
+
+function renderWaitingCard(w) {
+  const mine = w.applicant === App.name();
+  const card = html('div', {
+    class: `instance-card ${mine ? 'mine' : ''} wait-card status-${w.status}`,
+    id: 'wait-' + w.id
+  });
+
+  const [badgeCls, badgeText] = WAIT_STATUS[w.status] || ['unknown', w.status];
+  const head = html('div', { class: 'row' });
+  head.appendChild(html('b', {}, `申请 #${w.id}`));
+  head.appendChild(html('span', { class: 'muted' }, `进路 ${w.routeId}`));
+  if (w.status === 'waiting') {
+    head.appendChild(html('span', { class: 'badge amber' }, `顺位 ${w.queuePosition}`));
+  }
+  head.appendChild(html('span', { class: `badge ${badgeCls}` }, badgeText));
+  head.appendChild(html('span', { class: 'muted', style: 'flex:1;' }));
+  head.appendChild(html('span', { class: 'muted' }, `${w.applicant}${mine ? '（我）' : ''}`));
+  card.appendChild(head);
+
+  // 选择的道岔位置
+  const swText = Object.entries(w.switchPositions || {})
+    .map(([sid, p]) => `${sid}=${p}`).join('，');
+  if (swText) card.appendChild(html('div', { class: 'hint' }, '道岔选择：' + swText));
+
+  if (w.status === 'waiting' && w.blockReasons && w.blockReasons.length) {
+    const ul = html('ul', { class: 'reasons' });
+    w.blockReasons.slice(0, 4).forEach((reason) =>
+      ul.appendChild(html('li', {}, reason)));
+    card.appendChild(ul);
+  }
+
+  if (w.status === 'fulfilled') {
+    card.appendChild(html('div', { class: 'hint', style: 'color:var(--green);' },
+      `✓ 已兑现为进路实例 #${w.instanceId}（${w.closedAt ? '完成于 ' + w.closedAt.replace('T', ' ') : ''}），按下方实例序号提交走行事件`));
+  } else if (w.status !== 'waiting' && w.closeReason) {
+    card.appendChild(html('div', { class: 'hint' }, '原因：' + w.closeReason));
+  }
+
+  if (w.status === 'waiting' && mine) {
+    const row = html('div', { class: 'row', style: 'margin-top:6px;' });
+    const btn = html('button', { class: 'danger small' }, '撤销申请');
+    btn.addEventListener('click', () => cancelWait(w));
+    row.appendChild(btn);
+    row.appendChild(html('span', { class: 'hint' }, '仅本人可撤销未兑现的申请'));
+    card.appendChild(row);
+  }
+
+  return card;
+}
+
+async function cancelWait(w) {
+  if (!confirm(`撤销等待申请 #${w.id}（进路 ${w.routeId}）？`)) return;
+  try {
+    await api(`/api/waiting/${w.id}`, { method: 'DELETE' });
+    toast(`等待申请 #${w.id} 已撤销`, 'ok');
+    await load(true);
+  } catch (e) { toast(e.message, 'err', 6000); }
+}
+
 /* ----------------------------- 已开放进路 ----------------------------- */
 
 function renderInstances() {
   const box = html('div', {});
-  box.appendChild(html('div', { class: 'section-title' }, '④ 已开放进路与走行事件'));
+  box.appendChild(html('div', { class: 'section-title' }, '⑤ 已开放进路与走行事件'));
   if (STATE.openInstances.length === 0) {
     box.appendChild(html('div', { class: 'hint' }, '当前无已开放进路'));
   }

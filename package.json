@@ -7,7 +7,10 @@
   "scripts": {
     "start": "node src/server.js",
     "init-db": "node scripts/init-db.js",
-    "smoke": "node test/smoke.cjs"
+    "smoke": "node test/smoke.cjs",
+    "test:waiting": "node test/waiting.cjs",
+    "test:api": "node test/api-waiting.cjs",
+    "test": "npm run smoke && npm run test:waiting && npm run test:api"
   },
   "engines": {
     "node": ">=18"

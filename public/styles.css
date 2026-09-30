@@ -254,6 +254,11 @@ table.grid th { background: #f5f7fa; font-weight: 600; }
   background: #fcfdff;
 }
 .instance-card.mine { border-color: #b9cdf5; background: #f3f7ff; }
+/* 等待申请卡片状态色（左侧细条） */
+.wait-card.status-fulfilled { border-left: 4px solid var(--green); }
+.wait-card.status-invalidated { border-left: 4px solid var(--red); }
+.wait-card.status-cancelled { border-left: 4px solid var(--unknown); opacity: .85; }
+.wait-card.status-waiting { border-left: 4px solid var(--amber); }
 
 .toast-host {
   position: fixed;

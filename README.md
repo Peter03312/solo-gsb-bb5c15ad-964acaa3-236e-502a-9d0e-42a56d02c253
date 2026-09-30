@@ -11,6 +11,18 @@
 - **值班员页面**：选择进路及道岔位置 → 系统预检可否开放（信号状态、阻断原因）→
   开放进路（原子锁定区段/道岔）→ 按区段提交带**递增序号**的占用/清空事件 →
   列车进入首段信号自动回红 → 已清空区段逐段解锁 → 末段清空后整条进路解除。
+- **等待申请（排队排路）**：不想一直盯着盘面时，可按进路编号 + 道岔位置提交
+  **等待申请**（**不预锁任何资源**）。提交后可查看申请编号、**顺位**、当前
+  **阻断原因**及兑现后生成的进路实例，并可**撤销本人未兑现**的申请。系统在
+  *提交时、区段状态变化、道岔扳动、进路解除（走行清空）以及服务重启后* 自动
+  在**同一数据库事务内**重跑开放校验与锁闭尝试兑现：
+  - 按提交顺序（申请编号）排队：争用共享区段/道岔时，**仍有效的前项未兑现，
+    后项不得越过**；资源**互不相交**的申请可先兑现（并行进路）。
+  - 区段未知/占用、道岔实际位置不符、资源被他路锁闭时**继续等待**，阻断原因
+    每次自动尝试后刷新；重复触发幂等，**一个申请最多产生一个进路实例**。
+  - 进路定义被管理员**修改/删除** → 相关等待申请**失效并注明原因**；
+    **申请人退出登录**或**管理员重置推演** → 其未兑现申请被撤销。
+  - 等待状态与兑现结果全部落库，刷新页面、重启服务后均可见。
 - **联锁规则**
   - 开放时在单个 SQLite 事务内检查并锁定资源：区段被占用（含**未知状态按占用处理**）、
     道岔实际位置与要求不符、资源已被其他开放进路锁定时一律拒绝，**回滚且不留下
@@ -119,11 +131,79 @@ DB_PATH=./data/interlock.db npm start
 5. 同号同内容重传返回成功但不会重复生效（幂等）；同号异内容、跳号会被拒绝并提示
    涉及区段与正确序号。
 
+## 等待申请（排队排路）用法
+
+页面：值班员工作台选择进路、选好道岔位置后点 **"提交等待申请（不预锁）"**；
+侧栏 **"④ 等待申请"** 区域按顺位列出全班的等待申请，显示状态徽标、阻断原因、
+兑现后的实例编号，本人未兑现的申请可点 **"撤销申请"**。也可以不打开页面，
+直接调用下面的 HTTP API。
+
+### HTTP API（值班员令牌，`Authorization: Bearer <token>`）
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `POST /api/routes/:id/wait` | 按进路编号 + 道岔选择提交等待申请；提交时即尝试兑现 |
+| `GET /api/waiting` | 列出申请（默认**仅本人**；`?all=1` 看全班，含已兑现/失效/撤销） |
+| `GET /api/waiting/:id` | 查看单条申请（编号、顺位、阻断原因、兑现实例） |
+| `DELETE /api/waiting/:id` | **本人**撤销**未兑现**申请（非本人 / 已结束均拒绝） |
+| `GET /api/state` | 全量快照内含 `waitingRequests`（刷新/重启后恢复） |
+
+提交请求体与开放进路一致：`{"switchPositions": {"SW7": "N", "SW8": "N"}}`。
+
+申请 `status`：`waiting`（等待中）/ `fulfilled`（已兑现，带 `instanceId` 与
+`instance` 实例快照）/ `invalidated`（进路定义变更或删除而失效，带 `closeReason`）
+/ `cancelled`（本人撤销 / 退出 / 管理员重置）。`queuePosition` 为等待中的顺位；
+`blockReasons` 为最近一次自动尝试的阻断原因（含"前项申请 #n 未兑现不得越过"
+的排队提示）。
+
+兑现时机：提交时立即尝试；之后在 `POST /api/sections/:id/state`（区段状态变化）、
+`POST /api/switches/:id/move`（道岔扳动）、进路走行事件逐段解锁与末段清空自动
+解除（`POST /api/instances/:id/events`）以及**服务重启**后自动重跑。
+直接开放（`POST /api/routes/:id/open`）与走行事件的既有约定完全不变。
+
+### curl 调用示例
+
+```bash
+# 1) 值班员登录（也可直接用返回的 token 作为 Bearer）
+curl -s -X POST http://localhost:3000/api/auth/login/dispatcher \
+  -H 'Content-Type: application/json' -d '{"name":"值班员甲"}'
+# -> {"ok":true,"token":"<T1>", ...}
+
+# 2) 提交等待申请（不预锁资源；资源当前满足时立即兑现）
+curl -s -X POST http://localhost:3000/api/routes/R1/wait \
+  -H 'Content-Type: application/json' -H 'Authorization: Bearer <T1>' \
+  -d '{"switchPositions":{"SW7":"N","SW8":"N"}}'
+# 资源被占时 -> {"ok":true,"request":{"id":7,"routeId":"R1","status":"waiting",
+#                       "queuePosition":1,"blockReasons":["不能开放：区段 1 已被...锁定", ...], ...}}
+# 资源满足时 -> status:"fulfilled"，并带 instanceId / instance（已开放进路实例）
+
+# 3) 查看本人申请（?all=1 可看全班）
+curl -s http://localhost:3000/api/waiting -H 'Authorization: Bearer <T1>'
+curl -s http://localhost:3000/api/waiting/7 -H 'Authorization: Bearer <T1>'
+
+# 4) 撤销本人未兑现申请（他人申请返回 403 NOT_OWNER；已结束返回 409）
+curl -s -X DELETE http://localhost:3000/api/waiting/7 -H 'Authorization: Bearer <T1>'
+# -> {"ok":true,"request":{"id":7,"status":"cancelled","closeReason":"申请人主动撤销", ...}}
+
+# 5) 之后无需任何操作：他人清空区段 / 扳动道岔 / 进路解除 / 服务重启时，
+#    系统会在同一事务内自动重跑开放校验并兑现；GET 轮询可见 status 变 fulfilled、
+#    instanceId 指向新开放的进路实例，后续按既有事件接口走行即可。
+```
+
+拒绝场景（均为非 2xx + `code`）：未知进路 `ROUTE_NOT_FOUND`(404)；道岔未选择
+`SWITCH_NOT_CHOSEN`(400)、选择值非法 `BAD_POSITION`(400)、选择与进路定义不符
+`SWITCH_POSITION_MISMATCH`(409)；非本人撤销 `NOT_OWNER`(403)；撤销已结束申请
+`WAITING_NOT_ACTIVE`(409)。
+
 ## 数据持久化与重置
 
-- 全部拓扑、状态、事件、进路实例、会话均在本地 SQLite（默认卷 `interlock-data`）。
+- 全部拓扑、状态、事件、进路实例、会话、**等待申请**均在本地 SQLite（默认卷 `interlock-data`）。
 - 管理员页面"推演管理"提供：**清空推演状态**（删除进路实例/事件，区段恢复为未知、
-  道岔回 N，保留站场图）；**恢复示例初始状态**（额外把示例区段置为空闲）。
+  道岔回 N，保留站场图；**同时撤销全部未兑现等待申请**）；**恢复示例初始状态**
+  （额外把示例区段置为空闲，同样撤销等待申请）。
+- 管理员**修改或删除进路定义**时，引用该进路的等待申请自动置为"已失效"并注明原因；
+  存在已开放进路期间站场图仍不可编辑（既有保护不变）。
+- 值班员**退出登录**会撤销本人名下全部未兑现等待申请（已兑现/已开放的进路不受影响）。
 - 存在已开放进路期间，站场图（拓扑/进路定义）不可编辑，防止改变正在使用的线路。
 
 ## 目录结构
@@ -139,11 +219,21 @@ DB_PATH=./data/interlock.db npm start
 │   ├── schema.sql             # 表结构
 │   ├── seed.js                # 示例站场
 │   ├── auth.js                # 会话与鉴权
-│   ├── interlocking.js        # 核心联锁逻辑（开放/事件/解锁/扳岔）
+│   ├── interlocking.js        # 核心联锁逻辑（开放/事件/解锁/扳岔/等待申请排队兑现）
 │   └── routes/
-│       ├── auth.js
+│       ├── auth.js            # 登录/退出（退出联动撤销等待申请）
 │       ├── admin.js
-│       └── api.js             # 值班员接口
-├── public/                    # 前端页面（登录/管理员/值班员）
-└── test/smoke.cjs             # 无需鉴权的联锁冒烟/并发测试脚本
+│       └── api.js             # 值班员接口（含等待申请）
+├── public/                    # 前端页面（登录/管理员/值班员，值班页含等待申请面板）
+└── test/
+    ├── smoke.cjs              # 联锁冒烟/并发测试
+    ├── waiting.cjs            # 等待申请核心逻辑测试
+    └── api-waiting.cjs        # 等待申请 HTTP 端到端测试（含重启兑现）
+```
+
+## 测试
+
+```bash
+npm install
+npm test          # = smoke + test:waiting + test:api（使用临时库，不影响正式数据）
 ```

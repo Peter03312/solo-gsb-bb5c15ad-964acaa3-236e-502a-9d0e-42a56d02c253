@@ -72,4 +72,42 @@ router.post('/instances/:id/release', wrap((req, res) => {
   res.json({ ok: true, instance: detail });
 }));
 
+/* ------------------------------ 等待申请 ------------------------------ */
+
+// 等待申请列表（默认本人；?all=1 可看全班，含已兑现/失效/撤销记录）
+router.get('/waiting', (req, res) => {
+  const mine = req.query.all === '1' ? null : req.session.name;
+  res.json({ ok: true, requests: inter.listWaitingRequests({ mine }) });
+});
+
+// 单条等待申请详情
+router.get('/waiting/:id', wrap((req, res) => {
+  const detail = inter.getWaitingDetail(Number(req.params.id));
+  if (!detail) throw new InterlockError(404, 'WAITING_NOT_FOUND',
+    `等待申请 ${req.params.id} 不存在`);
+  res.json({ ok: true, request: detail });
+}));
+
+// 提交等待申请：不预锁资源，提交时即尝试兑现，之后随盘面变化自动重试
+router.post('/routes/:id/wait', wrap((req, res) => {
+  const positions = req.body.switchPositions;
+  if (!positions || typeof positions !== 'object' || Array.isArray(positions)) {
+    throw new InterlockError(400, 'BAD_SWITCH_POSITIONS',
+      'switchPositions 必须为 {道岔号: "N"|"R"} 形式的对象');
+  }
+  const detail = inter.submitWaitingRequest(req.params.id, positions, req.session.name);
+  res.json({
+    ok: true,
+    request: detail,
+    // 已兑现时直接带上进路实例，便于调用方即时处理
+    instance: detail.status === 'fulfilled' ? detail.instance : null
+  });
+}));
+
+// 撤销本人未兑现的等待申请（非本人 / 非等待中均拒绝）
+router.delete('/waiting/:id', wrap((req, res) => {
+  const detail = inter.cancelWaitingRequest(Number(req.params.id), req.session.name);
+  res.json({ ok: true, request: detail });
+}));
+
 module.exports = router;

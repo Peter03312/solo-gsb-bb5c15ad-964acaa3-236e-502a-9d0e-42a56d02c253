@@ -124,6 +124,28 @@ CREATE TABLE IF NOT EXISTS section_events (
   UNIQUE (instance_id, seq)
 );
 
+-- 值班员的"等待申请"：提交时不预锁任何资源，由系统在状态变化时自动尝试兑现。
+-- route_id 刻意不加外键：进路定义被删除后，已失效的申请记录仍需保留并说明原因。
+CREATE TABLE IF NOT EXISTS waiting_requests (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  route_id         TEXT NOT NULL,          -- 申请时的进路编号
+  applicant        TEXT NOT NULL,          -- 申请人（值班员姓名）
+  switch_positions TEXT NOT NULL DEFAULT '{}', -- 提交时选择的道岔位置 JSON，如 {"SW7":"N"}
+  -- waiting 等待中 / fulfilled 已兑现 / invalidated 定义变更失效 / cancelled 撤销
+  status           TEXT NOT NULL DEFAULT 'waiting'
+                   CHECK (status IN ('waiting','fulfilled','invalidated','cancelled')),
+  -- 最近一次尝试兑现时的阻断原因（JSON 字符串数组），每次自动尝试后刷新
+  block_reasons    TEXT NOT NULL DEFAULT '[]',
+  instance_id      INTEGER REFERENCES route_instances(id) ON DELETE SET NULL, -- 兑现后的进路实例
+  created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+  closed_at        TEXT,
+  close_reason     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_waiting_status ON waiting_requests(status, id);
+CREATE INDEX IF NOT EXISTS idx_waiting_applicant ON waiting_requests(applicant);
+
 CREATE INDEX IF NOT EXISTS idx_locks_instance ON route_locks(instance_id);
 CREATE INDEX IF NOT EXISTS idx_events_instance ON section_events(instance_id, seq);
 CREATE INDEX IF NOT EXISTS idx_steps_route ON route_steps(route_id, step_order);

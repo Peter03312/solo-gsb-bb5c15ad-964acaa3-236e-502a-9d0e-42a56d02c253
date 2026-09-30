@@ -3,7 +3,12 @@
 const express = require('express');
 const { getDb } = require('../db');
 const { requireAuth } = require('../auth');
-const { getState } = require('../interlocking');
+const {
+  getState,
+  invalidateWaitingForRouteTxn,
+  cancelAllWaitingTxn,
+  tryFulfillWaitingTxn
+} = require('../interlocking');
 
 const router = express.Router();
 router.use(requireAuth('admin'));
@@ -286,6 +291,11 @@ router.put('/routes/:id', wrap((req, res) => {
     value.switchReqs.forEach((r) =>
       db.prepare(`INSERT INTO route_switch_reqs(route_id,switch_id,req_position) VALUES(?,?,?)`)
         .run(value.id, r.switchId, r.position));
+    // 进路定义已变更：旧的等待申请按旧定义排队已无意义，统一失效并说明原因
+    invalidateWaitingForRouteTxn(value.id,
+      `进路 ${value.id} 定义已由管理员修改，原等待申请失效，请按新定义重新提交`);
+    // 失效后队中后续不相交申请可能可兑现
+    tryFulfillWaitingTxn();
   });
   tx();
   res.json({ ok: true });
@@ -294,8 +304,16 @@ router.put('/routes/:id', wrap((req, res) => {
 router.delete('/routes/:id', wrap((req, res) => {
   assertNoOpenInstances();
   const db = getDb();
-  const r = db.prepare(`DELETE FROM routes WHERE id=?`).run(req.params.id);
-  if (r.changes === 0) return res.status(404).json({ ok: false, error: `进路 ${req.params.id} 不存在` });
+  const exists = db.prepare(`SELECT 1 FROM routes WHERE id=?`).get(req.params.id);
+  if (!exists) return res.status(404).json({ ok: false, error: `进路 ${req.params.id} 不存在` });
+  db.transaction(() => {
+    // 先标记引用该进路的等待申请失效（waiting_requests.route_id 无外键，记录保留）
+    invalidateWaitingForRouteTxn(req.params.id,
+      `进路 ${req.params.id} 已由管理员删除，等待申请失效`);
+    db.prepare(`DELETE FROM routes WHERE id=?`).run(req.params.id);
+    // 队中后续不相交申请可能可兑现
+    tryFulfillWaitingTxn();
+  })();
   res.json({ ok: true });
 }));
 
@@ -311,6 +329,8 @@ router.post('/reset/state', wrap((req, res) => {
     db.prepare(`DELETE FROM route_instances`).run(); // 级联删除锁与事件
     db.prepare(`UPDATE sections SET occ_state='unknown'`).run();
     db.prepare(`UPDATE switches SET position='N'`).run();
+    // 管理员重置推演：撤销全部未兑现等待申请（记录保留以便复盘）
+    cancelAllWaitingTxn('管理员重置推演（清空推演状态），等待申请撤销');
   })();
   res.json({ ok: true, state: getState() });
 }));
@@ -325,6 +345,7 @@ router.post('/reset/training', wrap((req, res) => {
     db.prepare(`DELETE FROM route_instances`).run();
     db.prepare(`UPDATE sections SET occ_state='free'`).run();
     db.prepare(`UPDATE switches SET position='N'`).run();
+    cancelAllWaitingTxn('管理员重置推演（恢复示例初始状态），等待申请撤销');
   })();
   res.json({ ok: true, state: getState() });
 }));

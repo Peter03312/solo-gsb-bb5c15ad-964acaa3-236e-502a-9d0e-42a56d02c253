@@ -1,7 +1,9 @@
 'use strict';
 
 const express = require('express');
-const { adminPassword, createSession, destroySession, tokenOf } = require('../auth');
+const { getDb } = require('../db');
+const { adminPassword, createSession, destroySession, tokenOf, getSession } = require('../auth');
+const inter = require('../interlocking');
 
 const router = express.Router();
 
@@ -28,7 +30,14 @@ router.post('/login/admin', (req, res) => {
 });
 
 router.post('/logout', (req, res) => {
-  destroySession(tokenOf(req));
+  const token = tokenOf(req);
+  const session = getSession(token);
+  // 值班员退出：撤销其名下全部未兑现等待申请，并尝试兑现队中后续申请
+  if (session && session.role === 'dispatcher') {
+    getDb().transaction(() =>
+      inter.cancelWaitingByApplicantTxn(session.name, '申请人退出登录'))();
+  }
+  destroySession(token);
   res.clearCookie('sid');
   res.json({ ok: true });
 });
