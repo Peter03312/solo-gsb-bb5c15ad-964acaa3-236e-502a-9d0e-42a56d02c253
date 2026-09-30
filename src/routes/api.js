@@ -3,6 +3,7 @@
 const express = require('express');
 const { requireAuth } = require('../auth');
 const inter = require('../interlocking');
+const waiting = require('../waiting');
 const { InterlockError } = require('../interlocking');
 
 const router = express.Router();
@@ -70,6 +71,35 @@ router.post('/instances/:id/events', wrap((req, res) => {
 router.post('/instances/:id/release', wrap((req, res) => {
   const detail = inter.releaseInstance(Number(req.params.id), req.session.name);
   res.json({ ok: true, instance: detail });
+}));
+
+/* ------------------------------ 等待申请 ------------------------------ */
+
+// 提交等待申请（不预锁资源；提交后立即尝试兑现）
+router.post('/routes/:id/waiting', wrap((req, res) => {
+  const app = waiting.submitApplication(
+    req.params.id, req.body.switchPositions || {}, req.session.name
+  );
+  res.status(201).json({ ok: true, waiting: app });
+}));
+
+// 查看等待申请：默认返回本人全部；?scope=all 返回所有人（值班台仲裁展示用）；
+// 可选 ?status=waiting|fulfilled|cancelled|invalid
+router.get('/waiting', wrap((req, res) => {
+  const scope = String(req.query.scope || 'mine');
+  const status = ['waiting', 'fulfilled', 'cancelled', 'invalid'].includes(req.query.status)
+    ? req.query.status : null;
+  const list = waiting.listApplications({
+    applicant: scope === 'all' ? undefined : req.session.name,
+    status
+  });
+  res.json({ ok: true, waiting: list, me: req.session.name });
+}));
+
+// 撤销本人未兑现的等待申请（非本人 / 已结束均拒绝）
+router.post('/waiting/:id/cancel', wrap((req, res) => {
+  const app = waiting.cancelApplication(Number(req.params.id), req.session.name);
+  res.json({ ok: true, waiting: app });
 }));
 
 module.exports = router;

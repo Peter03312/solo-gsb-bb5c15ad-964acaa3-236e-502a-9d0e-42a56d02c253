@@ -160,100 +160,111 @@ function checkOpen(routeId, switchPositions = {}) {
 /* ------------------------------ 开放进路 ------------------------------ */
 
 /**
- * 开放进路：事务内完成 定义校验→区段占用/锁定校验→道岔选择/实际/锁定校验
- * →写实例→写全部区段/道岔锁→入口信号转绿。任何一步失败整体回滚。
+ * 开放进路：openRouteInTxn 的事务包装（供直接开放与等待兑现复用同一套
+ * 校验+锁闭代码路径）。
  */
 function openRoute(routeId, switchPositions, clientName) {
   const db = getDb();
-
-  const txn = db.transaction(() => {
-    const route = getRoute(routeId);
-    const steps = getRouteSteps(routeId);
-    const reqs = getRouteSwitchReqs(routeId);
-    if (steps.length === 0) {
-      throw new InterlockError(400, 'EMPTY_ROUTE', `进路 ${routeId} 未定义区段，无法开放`);
-    }
-
-    // 区段校验
-    for (const s of steps) {
-      const sec = db.prepare(`SELECT occ_state FROM sections WHERE id=?`).get(s.section_id);
-      if (!sec) throw new InterlockError(400, 'SECTION_MISSING',
-        `进路定义中的区段 ${s.section_id} 不存在，请通知管理员检查进路 ${routeId}`,
-        { sectionId: s.section_id });
-      if (sec.occ_state === 'occupied') {
-        throw new InterlockError(409, 'SECTION_OCCUPIED',
-          `不能开放：区段 ${s.section_id} 已被占用`, { sectionId: s.section_id });
-      }
-      if (sec.occ_state === 'unknown') {
-        throw new InterlockError(409, 'SECTION_UNKNOWN',
-          `不能开放：区段 ${s.section_id} 占用状态未知，按占用处理；请先核实并提交清空`,
-          { sectionId: s.section_id });
-      }
-      const holder = lockingInstance('section', s.section_id);
-      if (holder) {
-        throw new InterlockError(409, 'RESOURCE_LOCKED',
-          `不能开放：区段 ${s.section_id} 已被进路 #${holder.id}（${holder.route_id}，${holder.opened_by}）锁定`,
-          { sectionId: s.section_id, holder: holder.id });
-      }
-    }
-
-    // 道岔校验
-    for (const r of reqs) {
-      const sw = db.prepare(`SELECT position FROM switches WHERE id=?`).get(r.switch_id);
-      if (!sw) throw new InterlockError(400, 'SWITCH_MISSING',
-        `进路定义中的道岔 ${r.switch_id} 不存在`, { switchId: r.switch_id });
-      const chosen = (switchPositions || {})[r.switch_id];
-      if (!chosen) {
-        throw new InterlockError(400, 'SWITCH_NOT_CHOSEN',
-          `不能开放：道岔 ${r.switch_id} 未选择所需位置（进路要求 ${r.req_position}）`,
-          { switchId: r.switch_id, required: r.req_position });
-      }
-      if (chosen !== r.req_position) {
-        throw new InterlockError(409, 'SWITCH_POSITION_MISMATCH',
-          `不能开放：道岔 ${r.switch_id} 选择位置 ${chosen} 与进路要求 ${r.req_position} 不符`,
-          { switchId: r.switch_id, chosen, required: r.req_position });
-      }
-      if (sw.position !== r.req_position) {
-        throw new InterlockError(409, 'SWITCH_ACTUAL_MISMATCH',
-          `不能开放：道岔 ${r.switch_id} 实际位置为 ${sw.position}，与进路要求 ${r.req_position} 不符，请先扳道岔`,
-          { switchId: r.switch_id, actual: sw.position, required: r.req_position });
-      }
-      const holder = lockingInstance('switch', r.switch_id);
-      if (holder) {
-        throw new InterlockError(409, 'RESOURCE_LOCKED',
-          `不能开放：道岔 ${r.switch_id} 已被进路 #${holder.id}（${holder.route_id}，${holder.opened_by}）锁定`,
-          { switchId: r.switch_id, holder: holder.id });
-      }
-    }
-
-    // 建立进路实例（信号初始绿灯 = 允许车列进入）
-    const info = db
-      .prepare(`INSERT INTO route_instances(route_id,opened_by,status,signal_state,next_seq,head_step,tail_step)
-                VALUES(?,?, 'open','green',1,1,1)`)
-      .run(routeId, clientName);
-    const instanceId = info.lastInsertRowid;
-
-    const insLock = db.prepare(
-      `INSERT INTO route_locks(instance_id,resource_type,resource_id,step_order) VALUES(?,?,?,?)`
-    );
-    try {
-      for (const s of steps) insLock.run(instanceId, 'section', s.section_id, s.step_order);
-      for (const r of reqs) insLock.run(instanceId, 'switch', r.switch_id, null);
-    } catch (e) {
-      // 唯一约束冲突 = 并发争用仲裁失败；外层事务将整体回滚，无部分锁定
-      if (String(e.code) === 'SQLITE_CONSTRAINT_UNIQUE') {
-        throw new InterlockError(409, 'CONTENTION_LOST',
-          `开放失败：与并发申请的进路争用资源，本进路未获得锁（请刷新后重试）`,
-          { contention: true });
-      }
-      throw e;
-    }
-
-    return instanceId;
-  });
-
-  const instanceId = txn();
+  const instanceId = db.transaction(() =>
+    openRouteInTxn(routeId, switchPositions, clientName))();
   return getInstanceDetail(instanceId);
+}
+
+/**
+ * 开放进路（事务体）：定义校验→区段占用/锁定校验→道岔选择/实际/锁定校验
+ * →写实例→写全部区段/道岔锁→入口信号转绿。任何一步失败 throw，由外层事务
+ * （或等待兑现扫描中的 SAVEPOINT）整体回滚，不留下部分锁定。
+ *
+ * 直接开放时由 openRoute 包一层顶层事务；等待申请兑现扫描时，本函数在
+ * 扫描事务内的 SAVEPOINT 中执行，失败只回滚本次兑现尝试。
+ * @returns {number} 新建立的进路实例编号
+ */
+function openRouteInTxn(routeId, switchPositions, clientName) {
+  const db = getDb();
+
+  const route = getRoute(routeId);
+  const steps = getRouteSteps(routeId);
+  const reqs = getRouteSwitchReqs(routeId);
+  if (steps.length === 0) {
+    throw new InterlockError(400, 'EMPTY_ROUTE', `进路 ${routeId} 未定义区段，无法开放`);
+  }
+
+  // 区段校验
+  for (const s of steps) {
+    const sec = db.prepare(`SELECT occ_state FROM sections WHERE id=?`).get(s.section_id);
+    if (!sec) throw new InterlockError(400, 'SECTION_MISSING',
+      `进路定义中的区段 ${s.section_id} 不存在，请通知管理员检查进路 ${routeId}`,
+      { sectionId: s.section_id });
+    if (sec.occ_state === 'occupied') {
+      throw new InterlockError(409, 'SECTION_OCCUPIED',
+        `不能开放：区段 ${s.section_id} 已被占用`, { sectionId: s.section_id });
+    }
+    if (sec.occ_state === 'unknown') {
+      throw new InterlockError(409, 'SECTION_UNKNOWN',
+        `不能开放：区段 ${s.section_id} 占用状态未知，按占用处理；请先核实并提交清空`,
+        { sectionId: s.section_id });
+    }
+    const holder = lockingInstance('section', s.section_id);
+    if (holder) {
+      throw new InterlockError(409, 'RESOURCE_LOCKED',
+        `不能开放：区段 ${s.section_id} 已被进路 #${holder.id}（${holder.route_id}，${holder.opened_by}）锁定`,
+        { sectionId: s.section_id, holder: holder.id });
+    }
+  }
+
+  // 道岔校验
+  for (const r of reqs) {
+    const sw = db.prepare(`SELECT position FROM switches WHERE id=?`).get(r.switch_id);
+    if (!sw) throw new InterlockError(400, 'SWITCH_MISSING',
+      `进路定义中的道岔 ${r.switch_id} 不存在`, { switchId: r.switch_id });
+    const chosen = (switchPositions || {})[r.switch_id];
+    if (!chosen) {
+      throw new InterlockError(400, 'SWITCH_NOT_CHOSEN',
+        `不能开放：道岔 ${r.switch_id} 未选择所需位置（进路要求 ${r.req_position}）`,
+        { switchId: r.switch_id, required: r.req_position });
+    }
+    if (chosen !== r.req_position) {
+      throw new InterlockError(409, 'SWITCH_POSITION_MISMATCH',
+        `不能开放：道岔 ${r.switch_id} 选择位置 ${chosen} 与进路要求 ${r.req_position} 不符`,
+        { switchId: r.switch_id, chosen, required: r.req_position });
+    }
+    if (sw.position !== r.req_position) {
+      throw new InterlockError(409, 'SWITCH_ACTUAL_MISMATCH',
+        `不能开放：道岔 ${r.switch_id} 实际位置为 ${sw.position}，与进路要求 ${r.req_position} 不符，请先扳道岔`,
+        { switchId: r.switch_id, actual: sw.position, required: r.req_position });
+    }
+    const holder = lockingInstance('switch', r.switch_id);
+    if (holder) {
+      throw new InterlockError(409, 'RESOURCE_LOCKED',
+        `不能开放：道岔 ${r.switch_id} 已被进路 #${holder.id}（${holder.route_id}，${holder.opened_by}）锁定`,
+        { switchId: r.switch_id, holder: holder.id });
+    }
+  }
+
+  // 建立进路实例（信号初始绿灯 = 允许车列进入）
+  const info = db
+    .prepare(`INSERT INTO route_instances(route_id,opened_by,status,signal_state,next_seq,head_step,tail_step)
+              VALUES(?,?, 'open','green',1,1,1)`)
+    .run(routeId, clientName);
+  const instanceId = info.lastInsertRowid;
+
+  const insLock = db.prepare(
+    `INSERT INTO route_locks(instance_id,resource_type,resource_id,step_order) VALUES(?,?,?,?)`
+  );
+  try {
+    for (const s of steps) insLock.run(instanceId, 'section', s.section_id, s.step_order);
+    for (const r of reqs) insLock.run(instanceId, 'switch', r.switch_id, null);
+  } catch (e) {
+    // 唯一约束冲突 = 并发争用仲裁失败；外层事务将整体回滚，无部分锁定
+    if (String(e.code) === 'SQLITE_CONSTRAINT_UNIQUE') {
+      throw new InterlockError(409, 'CONTENTION_LOST',
+        `开放失败：与并发申请的进路争用资源，本进路未获得锁（请刷新后重试）`,
+        { contention: true });
+    }
+    throw e;
+  }
+
+  return instanceId;
 }
 
 /* ------------------------------ 扳动道岔 ------------------------------ */
@@ -276,6 +287,8 @@ function moveSwitch(switchId, targetPosition, clientName) {
     db.prepare(`UPDATE switches SET position=? WHERE id=?`).run(targetPosition, switchId);
   });
   txn();
+  // 道岔扳动后自动尝试兑现等待申请
+  triggerWaitingSweep('switch_moved');
   return { switchId, position: targetPosition, by: clientName };
 }
 
@@ -300,6 +313,8 @@ function setSectionState(sectionId, action, clientName) {
     db.prepare(`UPDATE sections SET occ_state=? WHERE id=?`).run(state, sectionId);
   });
   txn();
+  // 区段状态变化（占用/清空）后自动尝试兑现等待申请
+  triggerWaitingSweep('section_state_changed');
   return { sectionId, occState: action === 'occupy' ? 'occupied' : 'free', by: clientName };
 }
 
@@ -424,6 +439,8 @@ function submitSectionEvent(instanceId, seq, sectionId, action, clientName) {
 
   const result = txn();
   result.detail = getInstanceDetail(instanceId, true);
+  // 走行事件可能逐段解锁或整条进路解除 → 自动尝试兑现等待申请
+  triggerWaitingSweep('section_event');
   return result;
 }
 
@@ -455,6 +472,8 @@ function releaseInstance(instanceId, clientName) {
     db.prepare(`DELETE FROM route_locks WHERE instance_id=?`).run(instanceId);
   });
   txn();
+  // 进路解除后资源释放 → 自动尝试兑现等待申请
+  triggerWaitingSweep('route_released');
   return getInstanceDetail(instanceId, true);
 }
 
@@ -518,18 +537,34 @@ function getState() {
     signals,
     routes,
     openInstances,
-    recentReleased
+    recentReleased,
+    // 懒加载避免与 waiting.js 的循环依赖
+    waitingApplications: require('./waiting').listApplications()
   };
+}
+
+/**
+ * 状态变化后触发等待申请兑现扫描。懒加载 waiting.js 以避免循环依赖；
+ * 兑现本身不应影响已成功的主操作，扫描异常仅记录日志。
+ */
+function triggerWaitingSweep(reason) {
+  try {
+    require('./waiting').sweepFulfillments(reason);
+  } catch (e) {
+    console.error('[waiting] 兑现扫描失败:', e);
+  }
 }
 
 module.exports = {
   InterlockError,
   checkOpen,
   openRoute,
+  openRouteInTxn,
   moveSwitch,
   setSectionState,
   submitSectionEvent,
   releaseInstance,
   getState,
-  getInstanceDetail
+  getInstanceDetail,
+  triggerWaitingSweep
 };

@@ -3,7 +3,8 @@
 const express = require('express');
 const { getDb } = require('../db');
 const { requireAuth } = require('../auth');
-const { getState } = require('../interlocking');
+const { getState, triggerWaitingSweep } = require('../interlocking');
+const waiting = require('../waiting');
 
 const router = express.Router();
 router.use(requireAuth('admin'));
@@ -286,16 +287,41 @@ router.put('/routes/:id', wrap((req, res) => {
     value.switchReqs.forEach((r) =>
       db.prepare(`INSERT INTO route_switch_reqs(route_id,switch_id,req_position) VALUES(?,?,?)`)
         .run(value.id, r.switchId, r.position));
+    // 定义变更：该进路既有等待申请全部失效（与新定义可能不符）
+    waiting.invalidateByRouteChange(value.id,
+      `管理员修改了进路 ${value.id} 的定义，原等待申请失效`);
   });
   tx();
+  // 失效的是前项时后项可能因此可以兑现
+  triggerWaitingSweep('route_changed');
   res.json({ ok: true });
 }));
 
 router.delete('/routes/:id', wrap((req, res) => {
   assertNoOpenInstances();
   const db = getDb();
-  const r = db.prepare(`DELETE FROM routes WHERE id=?`).run(req.params.id);
-  if (r.changes === 0) return res.status(404).json({ ok: false, error: `进路 ${req.params.id} 不存在` });
+  const tx = db.transaction(() => {
+    // 已解除的历史实例对进路有外键引用；删除定义时一并清理其复盘记录
+    // （开放中的实例已在上面被 assertNoOpenInstances 拒绝）。
+    db.prepare(`DELETE FROM route_instances WHERE route_id=? AND status='released'`)
+      .run(req.params.id);
+    const r = db.prepare(`DELETE FROM routes WHERE id=?`).run(req.params.id);
+    if (r.changes === 0) {
+      // 抛错回滚（无其他写入，仅作 404 判定）
+      const err = new Error(`进路 ${req.params.id} 不存在`);
+      err.status = 404;
+      throw err;
+    }
+    // 进路删除：相关等待申请失效并说明原因
+    waiting.invalidateByRouteDelete(req.params.id);
+  });
+  try {
+    tx();
+  } catch (e) {
+    if (e && e.status === 404) return res.status(404).json({ ok: false, error: e.message });
+    throw e;
+  }
+  triggerWaitingSweep('route_deleted');
   res.json({ ok: true });
 }));
 
@@ -311,6 +337,8 @@ router.post('/reset/state', wrap((req, res) => {
     db.prepare(`DELETE FROM route_instances`).run(); // 级联删除锁与事件
     db.prepare(`UPDATE sections SET occ_state='unknown'`).run();
     db.prepare(`UPDATE switches SET position='N'`).run();
+    // 管理员重置推演：撤销全部等待申请
+    waiting.cancelAllByReset('管理员清空推演状态，全部等待申请撤销');
   })();
   res.json({ ok: true, state: getState() });
 }));
@@ -325,6 +353,8 @@ router.post('/reset/training', wrap((req, res) => {
     db.prepare(`DELETE FROM route_instances`).run();
     db.prepare(`UPDATE sections SET occ_state='free'`).run();
     db.prepare(`UPDATE switches SET position='N'`).run();
+    // 管理员重置推演：撤销全部等待申请
+    waiting.cancelAllByReset('管理员恢复示例初始状态（培训重开），全部等待申请撤销');
   })();
   res.json({ ok: true, state: getState() });
 }));

@@ -124,6 +124,36 @@ CREATE TABLE IF NOT EXISTS section_events (
   UNIQUE (instance_id, seq)
 );
 
+-- 等待申请（值班员排路等待，不预锁资源）
+-- 注意：route_id / instance_id 均不设外键级联：
+--  - 进路被删除/修改时，相关等待申请要保留下来并写明失效原因（status=invalid）；
+--  - 管理员重置会删除进路实例，已兑现申请保留 instance_id 作为溯源编号。
+-- 兑现与否完全由提交顺序 + 现有开放校验在同一事务内重新判定。
+CREATE TABLE IF NOT EXISTS waiting_applications (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  route_id    TEXT NOT NULL,
+  applicant   TEXT NOT NULL,           -- 申请人（值班员姓名）
+  -- 申请时选择并校验通过的道岔位置快照（JSON，键=道岔号 值=N/R）
+  switch_positions TEXT NOT NULL DEFAULT '{}',
+  -- waiting 等待中 / fulfilled 已兑现 / cancelled 已撤销 / invalid 因定义变更失效
+  status      TEXT NOT NULL DEFAULT 'waiting'
+              CHECK (status IN ('waiting','fulfilled','cancelled','invalid')),
+  instance_id INTEGER,                 -- 兑现后产生的进路实例编号
+  -- 最近一次自动兑现尝试的阻断原因（JSON 字符串数组）
+  block_reasons TEXT NOT NULL DEFAULT '[]',
+  -- 因"前项未兑现"被拦截时，挡在前面的等待申请编号（逗号分隔，展示用）
+  blocked_by  TEXT,
+  end_reason  TEXT,                    -- 撤销/失效说明
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  ended_at    TEXT
+);
+
+-- 同一等待申请最多兑现出一个进路实例（重复触发不得产生多个实例）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_waiting_instance
+  ON waiting_applications(instance_id) WHERE instance_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_waiting_status ON waiting_applications(status, id);
+CREATE INDEX IF NOT EXISTS idx_waiting_applicant ON waiting_applications(applicant);
+
 CREATE INDEX IF NOT EXISTS idx_locks_instance ON route_locks(instance_id);
 CREATE INDEX IF NOT EXISTS idx_events_instance ON section_events(instance_id, seq);
 CREATE INDEX IF NOT EXISTS idx_steps_route ON route_steps(route_id, step_order);
