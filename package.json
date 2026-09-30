@@ -1,0 +1,19 @@
+{
+  "name": "route-interlocking-sim",
+  "version": "1.0.0",
+  "description": "小型铁路站场培训用 Web 进路联锁推演台",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "init-db": "node scripts/init-db.js",
+    "smoke": "node test/smoke.cjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "express": "^4.19.2"
+  }
+}
